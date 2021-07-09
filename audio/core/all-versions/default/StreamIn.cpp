@@ -139,8 +139,7 @@ bool ReadThread::threadLoop() {
 }  // namespace
 
 StreamIn::StreamIn(const sp<Device>& device, audio_stream_in_t* stream)
-    : mIsClosed(false),
-      mDevice(device),
+    : mDevice(device),
       mStream(stream),
       mStreamCommon(new Stream(&stream->common)),
       mStreamMmap(new StreamMmap<audio_stream_in_t>(stream)),
@@ -159,7 +158,9 @@ StreamIn::~StreamIn() {
         status_t status = EventFlag::deleteEventFlag(&mEfGroup);
         ALOGE_IF(status, "read MQ event flag deletion error: %s", strerror(-status));
     }
+#if MAJOR_VERSION <= 5
     mDevice->closeInputStream(mStream);
+#endif
     mStream = nullptr;
 }
 
@@ -303,14 +304,16 @@ Return<void> StreamIn::getMmapPosition(getMmapPosition_cb _hidl_cb) {
 }
 
 Return<Result> StreamIn::close() {
-    if (mIsClosed) return Result::INVALID_STATE;
-    mIsClosed = true;
-    if (mReadThread.get()) {
-        mStopReadThread.store(true, std::memory_order_release);
+    if (mStopReadThread.load(std::memory_order_relaxed)) {  // only this thread writes
+        return Result::INVALID_STATE;
     }
+    mStopReadThread.store(true, std::memory_order_release);
     if (mEfGroup) {
         mEfGroup->wake(static_cast<uint32_t>(MessageQueueFlagBits::NOT_FULL));
     }
+#if MAJOR_VERSION >= 6
+    mDevice->closeInputStream(mStream);
+#endif
     return Result::OK;
 }
 
@@ -387,9 +390,9 @@ Return<void> StreamIn::prepareForReading(uint32_t frameSize, uint32_t framesCoun
     }
 
     // Create and launch the thread.
-    auto tempReadThread =
-        std::make_unique<ReadThread>(&mStopReadThread, mStream, tempCommandMQ.get(),
-                                     tempDataMQ.get(), tempStatusMQ.get(), tempElfGroup.get());
+    sp<ReadThread> tempReadThread =
+            new ReadThread(&mStopReadThread, mStream, tempCommandMQ.get(), tempDataMQ.get(),
+                           tempStatusMQ.get(), tempElfGroup.get());
     if (!tempReadThread->init()) {
         ALOGW("failed to start reader thread: %s", strerror(-status));
         sendError(Result::INVALID_ARGUMENTS);
@@ -405,7 +408,7 @@ Return<void> StreamIn::prepareForReading(uint32_t frameSize, uint32_t framesCoun
     mCommandMQ = std::move(tempCommandMQ);
     mDataMQ = std::move(tempDataMQ);
     mStatusMQ = std::move(tempStatusMQ);
-    mReadThread = tempReadThread.release();
+    mReadThread = tempReadThread;
     mEfGroup = tempElfGroup.release();
     threadInfo.pid = getpid();
     threadInfo.tid = mReadThread->getTid();
